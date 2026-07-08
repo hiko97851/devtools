@@ -7,20 +7,31 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Construct } from "constructs";
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 import { execSync } from "child_process";
 
 const SECRET_NAME = "strands-evals/dashboard-auth";
 
+type CredentialResult =
+  | { status: "ok"; username: string; password: string }
+  | { status: "skip" }
+  | { status: "unavailable" };
+
 /**
  * Fetches auth credentials from Secrets Manager at synth time.
- * Creates the secret with default values if it doesn't exist.
- * Returns { username, password } or null if in CI/bootstrap mode.
+ * Returns { status: "ok", ... } when the secret is readable, { status: "skip" }
+ * when bootstrap/skip mode is requested (CDK_BOOTSTRAP or SKIP_SECRET_FETCH),
+ * and { status: "unavailable" } when a real deploy has no readable secret. The
+ * secret is never created and no default values are supplied. The caller throws
+ * (fail-closed) only on "unavailable"; "skip" synthesizes an inert stack.
  */
-function fetchAuthCredentials(): { username: string; password: string } | null {
-  // Skip fetching during bootstrap or when AWS credentials aren't available
+function fetchAuthCredentials(): CredentialResult {
+  // Skip fetching during bootstrap or when AWS credentials aren't available.
+  // This is an explicit, operator-set escape hatch (not a missing secret), so
+  // it must stay distinct from the fail-closed path below.
   if (process.env.CDK_BOOTSTRAP || process.env.SKIP_SECRET_FETCH) {
-    console.log("Skipping secret fetch (bootstrap mode)");
-    return null;
+    console.log("Skipping secret fetch (bootstrap/skip mode)");
+    return { status: "skip" };
   }
 
   try {
@@ -29,11 +40,15 @@ function fetchAuthCredentials(): { username: string; password: string } | null {
       `aws secretsmanager get-secret-value --secret-id "${SECRET_NAME}" --region us-east-1 --query SecretString --output text 2>/dev/null`,
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     );
-    return JSON.parse(result.trim());
+    const parsed = JSON.parse(result.trim());
+    if (!parsed?.username || !parsed?.password) {
+      return { status: "unavailable" };
+    }
+    return { status: "ok", username: parsed.username, password: parsed.password };
   } catch {
-    console.log(`Secret "${SECRET_NAME}" not found or not accessible. Using placeholders.`);
+    console.log(`Secret "${SECRET_NAME}" not found or not accessible.`);
     console.log('Create the secret first with: aws secretsmanager create-secret --name "strands-evals/dashboard-auth" --secret-string \'{"username":"your-user","password":"your-pass"}\'');
-    return null;
+    return { status: "unavailable" };
   }
 }
 
@@ -52,19 +67,45 @@ export class DashboardStack extends cdk.Stack {
       encryption: s3.BucketEncryption.S3_MANAGED,
     });
 
-    // Fetch credentials from Secrets Manager at synth time
+    // Fetch credentials from Secrets Manager at synth time.
     const credentials = fetchAuthCredentials();
-    const username = credentials?.username ?? "__PLACEHOLDER_USERNAME__";
-    const password = credentials?.password ?? "__PLACEHOLDER_PASSWORD__";
+
+    // Fail closed on a real deploy with no readable secret, so the dashboard is
+    // never served with anything other than the configured secret values.
+    if (credentials.status === "unavailable") {
+      throw new Error(
+        `Dashboard auth credentials are unavailable. Create the secret "${SECRET_NAME}" before deploying:\n` +
+          `aws secretsmanager create-secret --name "${SECRET_NAME}" --secret-string '{"username":"your-username","password":"your-password"}'`
+      );
+    }
+
+    // In bootstrap/skip mode the secret is intentionally not fetched. Synthesize
+    // with random, single-use credentials so a skip-mode synth still succeeds
+    // (for bootstrap, cdk ls, credential-free CI) while the resulting stack is
+    // inert: the values are unguessable and are never written to the secret, so
+    // no one can authenticate against a stack produced this way. This is not a
+    // known default like the old placeholder, so it cannot become a real deploy
+    // credential.
+    const { username, password } =
+      credentials.status === "ok"
+        ? credentials
+        : {
+            username: crypto.randomBytes(24).toString("hex"),
+            password: crypto.randomBytes(24).toString("hex"),
+          };
 
     // Read the Lambda template and inject credentials
     const lambdaTemplatePath = path.join(__dirname, "../lambda/basic-auth/index.js");
     const lambdaTemplate = fs.readFileSync(lambdaTemplatePath, "utf-8");
 
-    // Replace placeholders with actual credentials
+    // Replace placeholders with JSON-encoded string literals. JSON.stringify
+    // safely escapes quotes, backslashes, backticks, and ${...} sequences so a
+    // credential value cannot corrupt or inject code into the generated Lambda.
+    // Use function replacers so "$" sequences in the JSON-encoded credential
+    // are inserted literally rather than interpreted by String.replace.
     const lambdaCode = lambdaTemplate
-      .replace("__BASIC_AUTH_USERNAME__", username)
-      .replace("__BASIC_AUTH_PASSWORD__", password);
+      .replace("__BASIC_AUTH_USERNAME__", () => JSON.stringify(username))
+      .replace("__BASIC_AUTH_PASSWORD__", () => JSON.stringify(password));
 
     // Lambda@Edge for Basic Authentication with injected credentials
     const basicAuthFunction = new cloudfront.experimental.EdgeFunction(
